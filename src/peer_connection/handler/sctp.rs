@@ -597,7 +597,15 @@ impl<'a>
                                 ::datachannel::data_channel::DataChannel::get_reliability_params(
                                     data_channel_open.channel_type,
                                 );
-                            let mut stream = conn.open_stream(message.stream_id, message.ppi)?;
+                            // Peer DATA can create a negotiated stream before the
+                            // local open reaches this handler. Retain its receive queue.
+                            let existing =
+                                message.negotiated && conn.stream(message.stream_id).is_ok();
+                            let mut stream = if existing {
+                                conn.stream(message.stream_id)?
+                            } else {
+                                conn.open_stream(message.stream_id, message.ppi)?
+                            };
                             stream.set_reliability_params(
                                 unordered,
                                 reliability_type,
@@ -863,6 +871,8 @@ mod tests {
     //! removal. These tests drive a real client<->server SCTP handshake through the
     //! public `sctp` API (no DTLS/ICE), then verify the draining association's final
     //! packet reaches `write_outs` instead of being lost.
+
+    mod negotiated_first_message;
 
     use super::*;
     use crate::data_channel::registry::DataChannelRegistry;

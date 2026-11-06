@@ -9,7 +9,7 @@ pub(crate) mod srtp;
 
 use crate::peer_connection::RTCPeerConnection;
 use crate::peer_connection::event::RTCPeerConnectionEvent;
-use crate::peer_connection::event::{RTCEventInternal, TaggedRTCEvent};
+use crate::peer_connection::event::{RTCEventInternal, TaggedRTCEvent, TaggedRTCEventInternal};
 use crate::peer_connection::handler::datachannel::{DataChannelHandler, DataChannelHandlerContext};
 use crate::peer_connection::handler::demuxer::{DemuxerHandler, DemuxerHandlerContext};
 use crate::peer_connection::handler::dtls::{DtlsHandler, DtlsHandlerContext};
@@ -286,6 +286,7 @@ impl RTCPeerConnection {
 
     fn pump_reads(&mut self, msg: Option<TaggedRTCMessageInternal>) {
         let mut intermediate_routs = VecDeque::<TaggedRTCMessageInternal>::new();
+        let mut intermediate_eouts = VecDeque::new();
 
         if let Some(msg) = msg {
             intermediate_routs.push_back(msg);
@@ -293,15 +294,26 @@ impl RTCPeerConnection {
 
         use sansio::Protocol;
         for_each_handler!(forward: process_handler!(self, handler, {
+            // A handshake and its first payload can arrive in the same flight.
+            // Initialize each downstream handler before delivering that payload.
+            while let Some(evt) = intermediate_eouts.pop_front() {
+                if let Err(err) = handler.handle_event(evt) {
+                    warn!("{}.handle_event got error: {}", handler.name(), err);
+                }
+            }
             while let Some(msg) = intermediate_routs.pop_front() {
                 if let Err(err) = handler.handle_read(msg) {
                     warn!("{}.handle_read got error: {}", handler.name(), err);
                 }
             }
+            while let Some(evt) = handler.poll_event() {
+                intermediate_eouts.push_back(evt);
+            }
             while let Some(msg) = handler.poll_read() {
                 intermediate_routs.push_back(msg);
             }
         }));
+        self.deliver_events(intermediate_eouts);
 
         // Finally, put intermediate_routs into RTCPeerConnection's routs
         while let Some(msg) = intermediate_routs.pop_front() {
@@ -370,8 +382,12 @@ impl RTCPeerConnection {
             }
         }));
 
-        // Finally, put intermediate_eouts into RTCPeerConnection's eouts
-        while let Some(evt_internal) = intermediate_eouts.pop_front() {
+        self.deliver_events(intermediate_eouts);
+        raised
+    }
+
+    fn deliver_events(&mut self, mut events: VecDeque<TaggedRTCEventInternal>) {
+        while let Some(evt_internal) = events.pop_front() {
             match &evt_internal.event {
                 RTCEventInternal::RTCPeerConnectionEvent(
                     RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(_),
@@ -387,8 +403,6 @@ impl RTCPeerConnection {
                 self.pipeline_context.event_outs.push_back(evt);
             }
         }
-
-        raised
     }
 }
 
@@ -591,6 +605,8 @@ impl sansio::Protocol<TaggedBytesMut, TaggedRTCMessage, TaggedRTCEvent> for RTCP
 
 #[cfg(test)]
 mod handler_test {
+    mod negotiated_first_message;
+
     use super::*;
     use crate::data_channel::message::RTCDataChannelMessage;
     use crate::peer_connection::RTCPeerConnectionBuilder;
